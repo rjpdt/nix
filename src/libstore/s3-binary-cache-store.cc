@@ -7,6 +7,12 @@
 #include "globals.hh"
 #include "compression.hh"
 #include "filetransfer.hh"
+#include <future>
+#include <memory>
+#include <deque>
+#include <map>
+#include <mutex>
+#include <stdexcept>
 
 #include <aws/core/Aws.h>
 #include <aws/core/VersionConfig.h>
@@ -87,6 +93,21 @@ static void initAWS()
     });
 }
 
+namespace {
+struct Chunk : std::enable_shared_from_this<Chunk>
+{
+    void complete()
+    {
+        // assert
+        promise.set_value(shared_from_this());
+    }
+
+    Aws::IOStream* stream = nullptr;
+    std::shared_ptr<TransferHandle> handle;
+    std::promise<std::shared_ptr<Chunk>> promise;
+};
+}
+
 S3Helper::S3Helper(
     const std::string & profile,
     const std::string & region,
@@ -107,6 +128,7 @@ S3Helper::S3Helper(
             Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
 #endif
             endpoint.empty()))
+    , executor{std::make_shared<Aws::Utils::Threading::PooledThreadExecutor>(std::thread::hardware_concurrency())}
 {
 }
 
@@ -182,6 +204,147 @@ S3Helper::FileTransferResult S3Helper::getObject(
     res.durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(now2 - now1).count();
 
     return res;
+}
+
+S3Helper::FileTransferResult S3Helper::getObject(
+    const std::string & bucketName, const std::string & key, Sink& sink)
+{
+    debug("fetching 's3://%s/%s'...", bucketName, key);
+
+    auto now1 = std::chrono::steady_clock::now();
+
+    auto createDownloadStreamFn = [](Chunk& chunk) {
+        return [&]()->Aws::IOStream*{
+            chunk.stream = Aws::New<std::stringstream>("STRINGSTREAM");
+            return chunk.stream;
+        };
+    };
+
+    std::mutex m;
+    std::map<const TransferHandle*, std::unique_ptr<Chunk>> transfers;
+    std::deque<std::future<std::shared_ptr<Chunk>>> chunks;
+    std::size_t next_chunk_offset = 0;
+    constexpr std::size_t chunk_size = 32 * 1024 * 1024;
+
+    // Limit the number of simultaneous transfers. Should be at least 2 so that
+    // we carry on downloading whilst writing to the sink.
+    constexpr std::size_t max_transfers = 3;
+
+    // Limit the number of chunks in flight. This caps memory usage to chunk_size * max_chunks
+    constexpr std::size_t max_chunks = 5;
+    const std::size_t object_size = getObjectSize(bucketName, key);
+
+
+    std::function<void()> start_downloads;
+
+    TransferManagerConfiguration config(executor.get());
+    config.downloadProgressCallback = [&](const TransferManager*, const std::shared_ptr<const TransferHandle>& handle)
+    {
+        std::lock_guard<std::mutex> g{m};
+        // TODO: tolerate handle not in transfers map?
+        switch(handle->GetStatus())
+        {
+            case Aws::Transfer::TransferStatus::NOT_STARTED:
+            case Aws::Transfer::TransferStatus::IN_PROGRESS:
+                break;
+            case Aws::Transfer::TransferStatus::COMPLETED:
+                transfers[handle.get()]->complete();
+                transfers.erase(handle.get());
+                break;
+            default:
+                try {
+                    // TODO: better message
+                    // TODO: retry logic?
+                    throw std::runtime_error("Error from AWS");
+                } catch(const std::runtime_error& e) {
+                    transfers[handle.get()]->promise.set_exception(std::current_exception());
+                    // TODO: explicitly cancel the transfer?
+                    transfers.erase(handle.get());
+                }
+                break;
+        }
+        start_downloads();
+    };
+
+    auto xfer_mgr = Aws::Transfer::TransferManager::Create(Aws::Transfer::TransferManagerConfiguration(config));
+
+    start_downloads = [&]{
+        while (next_chunk_offset < object_size and transfers.size() < max_transfers and chunks.size( ) < max_chunks)
+        {
+            auto chunk = std::make_unique<Chunk>();
+            const auto download_size = std::min(chunk_size, object_size - next_chunk_offset);
+            auto handle = xfer_mgr->DownloadFile(bucketName, key, next_chunk_offset, chunk_size, createDownloadStreamFn(*chunk));
+            next_chunk_offset += download_size;
+            chunk->handle = std::move(handle);
+            chunks.push_back(chunk->promise.get_future());
+            transfers[chunk->handle.get()] = std::move(chunk);
+        }
+    };
+
+    {
+        std::lock_guard<std::mutex> g{m};
+        start_downloads();
+    }
+
+    while (not chunks.empty())
+    {
+        std::shared_ptr<Chunk> chunk;
+        {
+            std::lock_guard<std::mutex> g{m};
+            chunk = std::move(chunks.front().get());
+        }
+        sink(dynamic_cast<std::stringstream&>(*chunk->stream).view());
+        {
+            std::lock_guard<std::mutex> g{m};
+            chunks.pop_front();
+            start_downloads();
+        }
+    }
+
+/*
+    auto request =
+        Aws::S3::Model::GetObjectRequest()
+        .WithBucket(bucketName)
+        .WithKey(key);
+
+    request.SetResponseStreamFactory([&]() {
+        return Aws::New<std::stringstream>("STRINGSTREAM");
+    });
+
+    FileTransferResult res;
+
+    auto now1 = std::chrono::steady_clock::now();
+
+    try {
+
+        auto result = checkAws(fmt("AWS error fetching '%s'", key),
+            client->GetObject(request));
+
+        res.data = decompress(result.GetContentEncoding(),
+            dynamic_cast<std::stringstream &>(result.GetBody()).str());
+
+    } catch (S3Error & e) {
+        if ((e.err != Aws::S3::S3Errors::NO_SUCH_KEY) &&
+            (e.err != Aws::S3::S3Errors::ACCESS_DENIED)) throw;
+    }
+    */
+
+    auto now2 = std::chrono::steady_clock::now();
+
+    FileTransferResult res;
+
+    res.data_size = object_size;
+    res.durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(now2 - now1).count();
+
+    return res;
+}
+
+std::size_t S3Helper::getObjectSize(const std::string& bucketName, const std::string& key)
+{
+    Aws::S3::Model::HeadObjectRequest headObjectRequest;
+    headObjectRequest.WithBucket(bucketName).WithKey(key);
+    const auto headOutcome = checkAws(fmt("AWS error checking object size '%s'", key), client->HeadObject(headObjectRequest));
+    return static_cast<std::size_t>(headOutcome.GetContentLength());
 }
 
 S3BinaryCacheStore::S3BinaryCacheStore(const Params & params)
@@ -410,16 +573,15 @@ struct S3BinaryCacheStoreImpl : virtual S3BinaryCacheStoreConfig, public virtual
         stats.get++;
 
         // FIXME: stream output to sink.
-        auto res = s3Helper.getObject(bucketName, path);
+        auto res = s3Helper.getObject(bucketName, path, sink);
 
-        stats.getBytes += res.data ? res.data->size() : 0;
+        stats.getBytes += res.data ? *res.data_size : 0;
         stats.getTimeMs += res.durationMs;
 
         if (res.data) {
             printTalkative("downloaded 's3://%s/%s' (%d bytes) in %d ms",
-                bucketName, path, res.data->size(), res.durationMs);
+                bucketName, path, *res.data_size, res.durationMs);
 
-            sink(*res.data);
         } else
             throw NoSuchBinaryCacheFile("file '%s' does not exist in binary cache '%s'", path, getUri());
     }
